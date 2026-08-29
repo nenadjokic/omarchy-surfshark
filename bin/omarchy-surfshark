@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""Backend for the Surfshark Omarchy bar widget.
+
+Surfshark's official Linux client is an Electron app with no CLI, but it does
+not do the work itself: the tunnel is brought up by a helper daemon,
+`surfsharkd`, which listens on a unix socket and speaks newline-delimited JSON.
+
+    /run/user/<uid>/surfsharkd.sock     (mode 0666 — no root needed)
+
+    {"method": "...", "params": [...]}\\n
+    -> {"type":"result","value":...} | {"type":"error","value":{...}}
+
+This backend talks to that same daemon. That is the whole design: no root, no
+second tunnel, and no separate bookkeeping — the app and the widget always
+agree, because they drive the same daemon.
+
+Daemon methods (discovered by probing; they are not documented anywhere):
+
+    getState()                              NetworkManager and tunnel state
+    connect(kind)                           kind is "wg" or "openvpn"
+    disconnect(kind)
+    addConnection(kind, {domain, pub, priv})
+    removeConnection(kind)
+    version()
+
+The server list, the "suggest" pick and the recent locations are read from the
+app's own cache in ~/.config/Surfshark, so neither the network traffic nor the
+selection logic is duplicated — "fastest" is the very server the app itself
+would have chosen.
+
+Commands:
+  status            JSON state (consumed by the widget)
+  on                connect to the last used location, else the fastest
+  off               tear the tunnel down
+  fastest           Surfshark's own suggestion (same as its Quick Connect)
+  nearest           geographically closest server abroad
+  same              best server in the country you are currently in
+  usa [host]        a United States exit (New York unless overridden)
+  random            a random country
+  connect <host>    a specific server, by connectionName
+  recent [n]        recently used locations
+  recent-clear      clear the recent list (and hide the app's own entries)
+  recent-restore    undo the last recent-clear
+  locations         JSON list of every location (used by the widget's search)
+  list [filter]     plain-text server list from the app's cache
+  key-import        copy the WireGuard key out of the app's NetworkManager profile
+  state             raw getState() output, for debugging
+"""
+
+import json
+import math
+import os
+import random
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+UID = os.getuid()
+SOCK = os.environ.get("SURFSHARKD_SOCK", "/run/user/%d/surfsharkd.sock" % UID)
+APP_DIR = os.path.expanduser("~/.config/Surfshark")
+CFG_DIR = os.path.expanduser("~/.config/omarchy-surfshark")
+KEY_FILE = os.path.join(CFG_DIR, "wg.key")
+RECENT_FILE = os.path.join(CFG_DIR, "recent.json")
+HIDDEN_FILE = os.path.join(CFG_DIR, "hidden.json")
+RECENT_BAK = RECENT_FILE + ".bak"
+
+GEO_URL = "https://api.surfshark.com/v1/server/user"
+GEO_TTL = 300
+
+# Default target for the "United States" shortcut. Overridable per call, so the
+# widget can expose it as a setting rather than baking one city in for everyone.
+USA_DEFAULT = "us-nyc.prod.surfshark.com"
+
+# NetworkManager active-connection states:
+# 1 = ACTIVATING, 2 = ACTIVATED, 3 = DEACTIVATING, 4 = DEACTIVATED.
+NM_AC_ACTIVATING = 1
+NM_AC_ACTIVATED = 2
+
+
+def _die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def _ensure_dir():
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+
+
+# ------------------------------------------------------------------ daemon
+
+def rpc(method, params=None, timeout=45):
+    """One call per connection. The daemon closes the socket after answering."""
+    if not os.path.exists(SOCK):
+        raise RuntimeError("the Surfshark daemon is not running (no %s)" % SOCK)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK)
+        s.sendall((json.dumps({"method": method, "params": params or []}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    if not buf.strip():
+        raise RuntimeError("the daemon did not answer %s" % method)
+    msg = json.loads(buf.decode())
+    if msg.get("type") == "error":
+        v = msg.get("value") or {}
+        raise RuntimeError(v.get("message") or v.get("name") or "daemon error")
+    return msg.get("value")
+
+
+def get_state():
+    try:
+        return rpc("getState") or {}
+    except Exception:
+        return {}
+
+
+def tunnel_up(state):
+    """Up if either backend is active or on its way up."""
+    for k in ("wg_active_connection_state", "openvpn_active_connection_state"):
+        if state.get(k) in (NM_AC_ACTIVATING, NM_AC_ACTIVATED):
+            return True
+    return False
+
+
+# ------------------------------------------------------------- app's own data
+
+def _load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def app_cache():
+    return _load_json(os.path.join(APP_DIR, "cache.json")) or {}
+
+
+def app_settings():
+    """Each account gets its own settings-<uuid>.json. `settings-undefined.json`
+    is the pre-login template and is skipped on purpose."""
+    best = None
+    try:
+        names = os.listdir(APP_DIR)
+    except OSError:
+        return {}
+    for n in names:
+        if not (n.startswith("settings-") and n.endswith(".json")):
+            continue
+        if n == "settings-undefined.json":
+            continue
+        p = os.path.join(APP_DIR, n)
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, p)
+    return (_load_json(best[1]) if best else None) or {}
+
+
+def _cache_value(cache, suffix):
+    """Cache keys look like '<physical connection uuid>|<path>', or just
+    '<path>'. Take the most recently refreshed entry ending in suffix."""
+    best = None
+    for k, v in cache.items():
+        if not k.endswith(suffix) or not isinstance(v, dict):
+            continue
+        if best is None or v.get("updatedAt", 0) > best.get("updatedAt", 0):
+            best = v
+    return (best or {}).get("value")
+
+
+def servers():
+    s = _cache_value(app_cache(), "/v5/server/clusters/all")
+    return s if isinstance(s, list) else []
+
+
+def suggested(foreign=False):
+    """Surfshark's own recommendation — what the app calls Quick Connect."""
+    suffix = "/v5/server/suggest/foreign?limit=1" if foreign else "/v5/server/suggest?limit=1"
+    v = _cache_value(app_cache(), suffix)
+    if isinstance(v, list) and v:
+        return v[0]
+    return None
+
+
+def generic(all_servers):
+    """Ordinary exits only — no static-IP, multihop and similar entries, which
+    are not what "fastest/nearest" should be offering."""
+    return [s for s in all_servers
+            if s.get("type") == "generic" and s.get("connectionName") and s.get("pubKey")]
+
+
+# ---------------------------------------------------------------------- geo
+
+_geo = {"at": 0, "data": None}
+
+
+def geo():
+    if _geo["data"] and time.time() - _geo["at"] < GEO_TTL:
+        return _geo["data"]
+    try:
+        req = urllib.request.Request(GEO_URL, headers={"User-Agent": "omarchy-surfshark"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode())
+    except Exception:
+        return _geo["data"] or {}
+    _geo["at"] = time.time()
+    _geo["data"] = d
+    return d
+
+
+# ----------------------------------------------------------- picking a server
+
+def coords(s):
+    c = s.get("coordinates") or {}
+    if c.get("latitude") is None or c.get("longitude") is None:
+        return None
+    return (c["latitude"], c["longitude"])
+
+
+def haversine(a, b):
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    h = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+
+def my_position(all_servers, g):
+    """The geo endpoint returns a country and a city, not coordinates. As an
+    approximate position, average the servers in our own country — accurate
+    enough when the comparison is between countries rather than streets."""
+    cc = (g or {}).get("countryCode")
+    if not cc:
+        return None
+    pts = [coords(s) for s in all_servers if s.get("countryCode") == cc and coords(s)]
+    if not pts:
+        return None
+    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+
+def pick_fastest(all_servers, g):
+    s = suggested()
+    if s and s.get("pubKey"):
+        return s
+    # The suggestion cache is empty (the app has not fetched it yet) — fall back
+    # to the least loaded server among the nearest. Home country is *not*
+    # skipped here: "fastest" is allowed to be local.
+    return pick_nearest(all_servers, g, by_load=True, foreign=False)
+
+
+def pick_nearest(all_servers, g, by_load=False, foreign=True):
+    """Closest server. Skips your own country by default: otherwise "Nearest
+    country" returns exactly what "Same country" returns every time your country
+    has a server, and two menu rows end up doing the same thing."""
+    pool = generic(all_servers)
+    cc = (g or {}).get("countryCode")
+    if foreign and cc:
+        without_home = [s for s in pool if s.get("countryCode") != cc]
+        if without_home:
+            pool = without_home
+    pos = my_position(all_servers, g)
+    withc = [s for s in pool if coords(s)]
+    if not withc:
+        return min(pool, key=lambda s: s.get("load", 100)) if pool else None
+    if not pos:
+        return min(withc, key=lambda s: s.get("load", 100))
+    withc.sort(key=lambda s: haversine(pos, coords(s)))
+    if by_load:
+        return min(withc[:12], key=lambda s: s.get("load", 100))
+    return withc[0]
+
+
+def pick_same(all_servers, g):
+    cc = (g or {}).get("countryCode")
+    if not cc:
+        return None
+    pool = [s for s in generic(all_servers) if s.get("countryCode") == cc]
+    if not pool:
+        return None
+    return min(pool, key=lambda s: s.get("load", 100))
+
+
+def pick_usa(all_servers, preferred=None):
+    """A US exit, preferring one specific city. If that city is missing from the
+    cache, fall back to the least loaded US server rather than failing."""
+    pool = [s for s in generic(all_servers) if s.get("countryCode") == "US"]
+    if not pool:
+        return None
+    want = preferred or USA_DEFAULT
+    for s in pool:
+        if s.get("connectionName") == want:
+            return s
+    return min(pool, key=lambda s: s.get("load", 100))
+
+
+def pick_random(all_servers, g):
+    """A random country, then the least loaded server inside it.
+
+    Country first, then server — not a server straight out of the pool. Picking
+    a server directly would surface countries with twenty-odd exits (the US,
+    Germany) far more often than one-exit countries, so "random country" would
+    be random by server rather than by country, which is not the same thing.
+    Your own country is skipped: staying home is not a change of location.
+    """
+    pool = generic(all_servers)
+    cc = (g or {}).get("countryCode")
+    by_country = {}
+    for s in pool:
+        code = s.get("countryCode")
+        if not code or code == cc:
+            continue
+        by_country.setdefault(code, []).append(s)
+    if not by_country:
+        return None
+    # Don't hand back the country you are already in, as long as there is a
+    # choice — two clicks in a row should actually move you.
+    here = current_host()
+    if here:
+        cur = find_host(all_servers, here)
+        cur_cc = (cur or {}).get("countryCode")
+        if cur_cc in by_country and len(by_country) > 1:
+            del by_country[cur_cc]
+    choice = random.choice(sorted(by_country))
+    return min(by_country[choice], key=lambda s: s.get("load", 100))
+
+
+def find_host(all_servers, host):
+    for s in all_servers:
+        if s.get("connectionName") == host:
+            return s
+    return None
+
+
+# ------------------------------------------------------------- WireGuard key
+
+def read_key():
+    try:
+        with open(KEY_FILE) as f:
+            k = f.read().strip()
+        return k or None
+    except OSError:
+        return None
+
+
+def store_key(k):
+    _ensure_dir()
+    tmp = KEY_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(k + "\n")
+    os.replace(tmp, KEY_FILE)
+
+
+def key_from_nm():
+    """On its first connection the app creates a NetworkManager WireGuard
+    profile and writes the account's private key into it. We lift it out of
+    there once, so that afterwards we can switch servers on our own."""
+    try:
+        out = subprocess.run(
+            ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    names = [ln.rsplit(":", 1)[0] for ln in out.splitlines()
+             if ln.endswith(":wireguard")]
+    names = [n for n in names if "surfshark" in n.lower()] or names
+    for n in names:
+        try:
+            p = subprocess.run(
+                ["nmcli", "-s", "-g", "wireguard.private-key", "connection", "show", n],
+                capture_output=True, text=True, timeout=10)
+            k = p.stdout.strip()
+            if k and k != "--":
+                return k
+        except Exception:
+            continue
+    return None
+
+
+def require_key():
+    k = read_key() or key_from_nm()
+    if k:
+        store_key(k)
+        return k
+    _die("No WireGuard key yet. Connect once through the Surfshark app, then "
+         "run: omarchy-surfshark key-import", 7)
+
+
+# ------------------------------------------------------------------- recents
+
+def hidden():
+    """Suppressed entries.
+
+    "Clear" cannot simply drop our own list: half of it comes from the app's own
+    `recents`, so the next status poll would bring the same entries straight
+    back and the button would look broken. So whatever was on the list at the
+    moment of clearing is remembered as hidden, until you connect there again.
+    """
+    v = _load_json(HIDDEN_FILE)
+    return set(v) if isinstance(v, list) else set()
+
+
+def store_hidden(names):
+    _ensure_dir()
+    tmp = HIDDEN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(names), f, indent=1)
+    os.replace(tmp, HIDDEN_FILE)
+
+
+def recent(limit=None):
+    """Merge our own log with the app's `recents`, so the list is the same no
+    matter where the connection was started from."""
+    skip = hidden()
+    mine = [i for i in (_load_json(RECENT_FILE) or [])
+            if i.get("connectionName") not in skip]
+    items = list(mine)
+    have = {i.get("connectionName") for i in items}
+    all_servers = servers()
+    for r in (app_settings().get("recents") or []):
+        host = None
+        if isinstance(r, dict):
+            host = r.get("connectionName") or r.get("id") or r.get("target")
+        elif isinstance(r, str):
+            host = r
+        if not host or host in have or host in skip:
+            continue
+        s = find_host(all_servers, host)
+        if not s:
+            continue
+        have.add(host)
+        items.append({
+            "connectionName": host,
+            "country": s.get("country", ""),
+            "countryCode": s.get("countryCode", ""),
+            "location": s.get("location", ""),
+            "usedAt": 0,
+        })
+    items.sort(key=lambda i: i.get("usedAt", 0), reverse=True)
+    return items[:limit] if limit else items
+
+
+def push_recent(s):
+    _ensure_dir()
+    entry = {
+        "connectionName": s["connectionName"],
+        "country": s.get("country", ""),
+        "countryCode": s.get("countryCode", ""),
+        "location": s.get("location", ""),
+        "usedAt": time.time(),
+    }
+    mine = [i for i in (_load_json(RECENT_FILE) or [])
+            if i.get("connectionName") != entry["connectionName"]]
+    mine.insert(0, entry)
+    was = hidden()
+    if entry["connectionName"] in was:
+        store_hidden(was - {entry["connectionName"]})
+    tmp = RECENT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(mine[:10], f, indent=1)
+    os.replace(tmp, RECENT_FILE)
+
+
+def note_current(host):
+    _ensure_dir()
+    with open(os.path.join(CFG_DIR, "current"), "w") as f:
+        f.write(host + "\n")
+
+
+def current_host():
+    try:
+        with open(os.path.join(CFG_DIR, "current")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------- connecting
+
+def connect_to(s):
+    if not s:
+        _die("no matching server", 5)
+    if not s.get("pubKey"):
+        _die("server %s has no WireGuard key in the app's cache"
+             % s.get("connectionName"), 5)
+    priv = require_key()
+    # The daemon will not edit a live profile in place: describe the new one
+    # first, then activate it.
+    rpc("addConnection", ["wg", {
+        "domain": s["connectionName"],
+        "pub": s["pubKey"],
+        "priv": priv,
+    }])
+    rpc("connect", ["wg"])
+    push_recent(s)
+    note_current(s["connectionName"])
+    print("%s · %s" % (s.get("location", "?"), s.get("country", "?")))
+
+
+def disconnect_all():
+    last = None
+    ok = False
+    for kind in ("wg", "openvpn"):
+        try:
+            rpc("disconnect", [kind])
+            ok = True
+        except Exception as e:
+            last = e
+    if not ok and last:
+        _die(str(last), 4)
+    print("disconnected")
+
+
+def turn_on():
+    """If a profile already exists, just activate it — that preserves whichever
+    server the app set last, and needs no key at all."""
+    r = recent(1)
+    if r:
+        s = find_host(servers(), r[0]["connectionName"])
+        if s:
+            connect_to(s)
+            return
+    try:
+        rpc("connect", ["wg"])
+        print("connected")
+        return
+    except Exception:
+        pass
+    connect_to(pick_fastest(servers(), geo()))
+
+
+# ------------------------------------------------------------------ commands
+
+def ensure_key_cached():
+    """Copy the key out of the NM profile as soon as it is visible, on every
+    status poll.
+
+    NetworkManager only hands out `wireguard.private-key` while the profile the
+    app created exists and is readable; after a disconnect it can disappear. If
+    we relied on someone running the import by hand, the widget would fall back
+    to "not set up" after every teardown. So status — which already runs every
+    20 seconds — pins it to disk the first time it sees it.
+    """
+    if read_key():
+        return True
+    k = key_from_nm()
+    if k:
+        store_key(k)
+        return True
+    return False
+
+
+def cmd_status():
+    state = get_state()
+    up = tunnel_up(state)
+    g = geo()
+    host = current_host()
+    s = find_host(servers(), host) if host else None
+    have_servers = bool(servers())
+    out = {
+        "daemon": os.path.exists(SOCK),
+        "configured": ensure_key_cached() and have_servers,
+        "connected": up,
+        "endpoint": host if up else None,
+        "location": (s or {}).get("location", "") if up else "",
+        "country": (s or {}).get("country", "") if up else "",
+        "countryCode": (s or {}).get("countryCode", "") if up else "",
+        "load": (s or {}).get("load"),
+        "ip": g.get("ip", ""),
+        "secured": bool(g.get("secured")),
+        "myCountry": g.get("country", ""),
+        "myCountryCode": g.get("countryCode", ""),
+        "myCity": g.get("city", ""),
+        "recent": recent(5),
+    }
+    print(json.dumps(out, indent=1))
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "off":
+        disconnect_all()
+    elif cmd == "on":
+        turn_on()
+    elif cmd == "fastest":
+        connect_to(pick_fastest(servers(), geo()))
+    elif cmd == "nearest":
+        connect_to(pick_nearest(servers(), geo()))
+    elif cmd == "same":
+        g = geo()
+        s = pick_same(servers(), g)
+        if not s:
+            _die("no Surfshark server in your country: %s" % g.get("country", "?"), 6)
+        connect_to(s)
+    elif cmd == "usa":
+        s = pick_usa(servers(), args[1] if len(args) > 1 else None)
+        if not s:
+            _die("no US servers in the app's cache", 6)
+        connect_to(s)
+    elif cmd == "random":
+        s = pick_random(servers(), geo())
+        if not s:
+            _die("nothing to pick a random country from", 6)
+        connect_to(s)
+    elif cmd == "connect":
+        if len(args) < 2:
+            _die("usage: omarchy-surfshark connect <connectionName>")
+        s = find_host(servers(), args[1])
+        if not s:
+            _die("unknown server: %s" % args[1])
+        connect_to(s)
+    elif cmd == "locations":
+        out = [{
+            "connectionName": s["connectionName"],
+            "country": s.get("country", ""),
+            "countryCode": s.get("countryCode", ""),
+            "location": s.get("location", ""),
+            "load": s.get("load"),
+        } for s in generic(servers())]
+        out.sort(key=lambda i: (i["country"], i["location"]))
+        print(json.dumps(out))
+    elif cmd == "recent-clear":
+        # Set aside rather than delete. Clearing is one click with no
+        # confirmation, so it must be undoable — see `recent-restore`.
+        store_hidden({i["connectionName"] for i in recent()} | hidden())
+        try:
+            os.replace(RECENT_FILE, RECENT_BAK)
+        except OSError:
+            pass
+        print("recent list cleared (undo with: omarchy-surfshark recent-restore)")
+    elif cmd == "recent-restore":
+        restored = os.path.exists(RECENT_BAK)
+        if restored:
+            os.replace(RECENT_BAK, RECENT_FILE)
+        try:
+            os.remove(HIDDEN_FILE)
+        except OSError:
+            pass
+        print("recent list restored" if restored
+              else "nothing set aside; un-hid the app's own entries")
+    elif cmd == "recent":
+        n = int(args[1]) if len(args) > 1 else 10
+        print(json.dumps(recent(n), indent=1))
+    elif cmd == "list":
+        filt = args[1].lower() if len(args) > 1 else ""
+        for s in generic(servers()):
+            line = "%-34s %-22s %-16s load=%s" % (
+                s["connectionName"], s.get("country", ""), s.get("location", ""), s.get("load"))
+            if not filt or filt in line.lower():
+                print(line)
+    elif cmd == "key-import":
+        k = key_from_nm()
+        if not k:
+            _die("no WireGuard key found in any NetworkManager profile. Connect "
+                 "once through the Surfshark app, then try again.", 7)
+        store_key(k)
+        print("key saved to %s" % KEY_FILE)
+    elif cmd == "state":
+        print(json.dumps(get_state(), indent=1))
+    else:
+        _die(__doc__)
+
+
+if __name__ == "__main__":
+    main()

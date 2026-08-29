@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "nenadjokic.surfshark",
+  "name": "Surfshark",
+  "version": "1.0.0",
+  "author": "nenadjokic",
+  "license": "MIT",
+  "description": "Surfshark VPN in the Omarchy bar: on/off, fastest, nearest, same country, a pinned US exit, a random country, recents and a search across every location. Drives the official client's own daemon, so the app and the bar never disagree.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Surfshark",
+    "description": "Toggle Surfshark, jump to the fastest, nearest, local, US or a random location, reconnect to recents, or search all locations.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 20,
+      "usLocation": "us-nyc.prod.surfshark.com"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "State refresh (seconds)",
+        "min": 5,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 20
+      },
+      {
+        "key": "usLocation",
+        "type": "string",
+        "label": "United States shortcut target",
+        "defaultValue": "us-nyc.prod.surfshark.com"
+      }
+    ]
+  }
+}
