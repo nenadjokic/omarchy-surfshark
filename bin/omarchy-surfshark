@@ -28,6 +28,14 @@ app's own cache in ~/.config/Surfshark, so neither the network traffic nor the
 selection logic is duplicated — "fastest" is the very server the app itself
 would have chosen.
 
+Every read here is bounded and every write is confined. Responses, the app's
+cache and our own files are read through a hard byte cap checked before the
+bytes are parsed; the config directory is reached by walking one component at a
+time with `O_NOFOLLOW` and verified to be ours and private; and files are
+written to a randomly named temporary created `O_EXCL | O_NOFOLLOW` at 0600,
+then published with a descriptor-relative rename. This matters most for
+`wg.key`, which holds the account's WireGuard private key.
+
 Commands:
   status            JSON state (consumed by the widget)
   on                connect to the last used location, else the fastest
@@ -47,27 +55,49 @@ Commands:
   state             raw getState() output, for debugging
 """
 
+import errno
 import json
 import math
 import os
 import random
+import secrets
 import socket
+import stat
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 UID = os.getuid()
+HOME = os.path.expanduser("~")
 SOCK = os.environ.get("SURFSHARKD_SOCK", "/run/user/%d/surfsharkd.sock" % UID)
-APP_DIR = os.path.expanduser("~/.config/Surfshark")
-CFG_DIR = os.path.expanduser("~/.config/omarchy-surfshark")
-KEY_FILE = os.path.join(CFG_DIR, "wg.key")
-RECENT_FILE = os.path.join(CFG_DIR, "recent.json")
-HIDDEN_FILE = os.path.join(CFG_DIR, "hidden.json")
-RECENT_BAK = RECENT_FILE + ".bak"
+
+# Directories as components rather than as strings to be re-walked: each one is
+# opened a component at a time so no part of it can be swapped for a symlink.
+APP_REL = (".config", "Surfshark")
+CFG_REL = (".config", "omarchy-surfshark")
+CFG_DISPLAY = os.path.join(HOME, *CFG_REL)
+
+KEY_NAME = "wg.key"
+RECENT_NAME = "recent.json"
+RECENT_BAK_NAME = "recent.json.bak"
+HIDDEN_NAME = "hidden.json"
+CURRENT_NAME = "current"
 
 GEO_URL = "https://api.surfshark.com/v1/server/user"
 GEO_TTL = 300
+
+# Caps. Each read is checked against one of these before anything is parsed.
+# The app's own cache is the big one — a full server list is around 120 KB, so
+# 16 MiB is far past anything real while still being a limit.
+MAX_APP_JSON = 16 * 1024 * 1024
+MAX_OWN_JSON = 1024 * 1024
+MAX_KEY_BYTES = 4096
+MAX_GEO_BYTES = 256 * 1024
+MAX_RPC_BYTES = 4 * 1024 * 1024
+CHUNK = 65536
 
 # Default target for the "United States" shortcut. Overridable per call, so the
 # widget can expose it as a setting rather than baking one city in for everyone.
@@ -79,13 +109,181 @@ NM_AC_ACTIVATING = 1
 NM_AC_ACTIVATED = 2
 
 
+class Unsafe(Exception):
+    """A path or a response failed one of the checks below."""
+
+
 def _die(msg, code=1):
     print(msg, file=sys.stderr)
     sys.exit(code)
 
 
-def _ensure_dir():
-    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+# ------------------------------------------------------------- safe file I/O
+
+def _check_dir(fd, shown, own):
+    """A directory descriptor is only usable if it is a directory, ours, and
+    not writable by anyone else.
+
+    `own` marks the one directory this plugin creates and maintains. That one is
+    tightened in place — `os.makedirs(mode=...)` does nothing to a directory
+    that already exists, so a mode set at creation time proves nothing later. A
+    directory belonging to something else is reported rather than changed.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Unsafe("%s is not a directory" % shown)
+    if st.st_uid != os.getuid():
+        raise Unsafe("%s is not owned by you" % shown)
+    if own:
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+    elif st.st_mode & 0o022:
+        raise Unsafe("%s is writable by other users" % shown)
+
+
+def _open_child_dir(parent_fd, name, shown, create, own):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as e:
+        # With O_DIRECTORY in the flags a symlink trips ENOTDIR rather than the
+        # ELOOP a plain O_NOFOLLOW open would give, and ENOTDIR is equally
+        # disqualifying when it means the component is a regular file.
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Unsafe("%s is a symlink or not a directory" % shown)
+        raise
+    try:
+        _check_dir(fd, shown, own)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_dir(parts, create=False, own=False):
+    """Open a directory under $HOME without ever following a symlink.
+
+    The walk is anchored at the home directory and each component below it is
+    opened `O_NOFOLLOW` from its parent's descriptor, so the path cannot be
+    swapped underneath us between one component and the next. `own` applies to
+    the last component only — the intermediate `.config` belongs to everything
+    else on the system, not to us.
+
+    The caller closes the returned descriptor.
+    """
+    fd = os.open(HOME, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _check_dir(fd, HOME, False)
+        shown = HOME
+        for i, comp in enumerate(parts):
+            shown = os.path.join(shown, comp)
+            child = _open_child_dir(fd, comp, shown, create, own and i == len(parts) - 1)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_file(dir_fd, name, limit):
+    """A bounded, no-follow read of one regular file we own."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Unsafe("%s is a symlink" % name)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Unsafe("%s is not a regular file" % name)
+        if st.st_uid != os.getuid():
+            raise Unsafe("%s is not owned by you" % name)
+        if st.st_size > limit:
+            raise Unsafe("%s is larger than %d bytes" % (name, limit))
+        buf = b""
+        # One byte past the cap is read on purpose: a file that grew between the
+        # fstat and the read is then caught rather than silently truncated.
+        while len(buf) <= limit:
+            chunk = os.read(fd, min(CHUNK, limit + 1 - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+        if len(buf) > limit:
+            raise Unsafe("%s is larger than %d bytes" % (name, limit))
+        return buf
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _write_private(dir_fd, name, data):
+    """Publish a private file atomically, relative to a verified descriptor.
+
+    The temporary name is random and created `O_EXCL | O_NOFOLLOW` at 0600, so
+    it cannot collide with, or be pre-empted by, anything already sitting in the
+    directory; the rename gives both ends as descriptors rather than as paths
+    walked a second time. A symlink planted at the destination is replaced, not
+    followed.
+    """
+    tmp = ".%s.%s.tmp" % (name, secrets.token_hex(8))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o600, dir_fd=dir_fd)
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    try:
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+
+def cfg_dir(create=True):
+    """Our own directory: created 0700, and tightened to 0700 if it is not."""
+    return _open_dir(CFG_REL, create=create, own=True)
+
+
+def _read_json_in(parts, name, limit, own=False):
+    """Read one JSON file, or None if it is missing, oversized or not ours."""
+    try:
+        dir_fd = _open_dir(parts, create=False, own=own)
+    except (OSError, Unsafe):
+        return None
+    try:
+        return json.loads(_read_file(dir_fd, name, limit).decode("utf-8"))
+    except (OSError, ValueError, Unsafe):
+        return None
+    finally:
+        os.close(dir_fd)
+
+
+def _read_text_in(dir_fd, name, limit):
+    try:
+        return _read_file(dir_fd, name, limit).decode("utf-8")
+    except (OSError, ValueError, Unsafe):
+        return None
 
 
 # ------------------------------------------------------------------ daemon
@@ -100,11 +298,16 @@ def rpc(method, params=None, timeout=45):
         s.connect(SOCK)
         s.sendall((json.dumps({"method": method, "params": params or []}) + "\n").encode())
         buf = b""
+        # Bounded: a reply is one short JSON line, so anything that keeps coming
+        # is a fault, and reading it to the end would be unbounded memory.
         while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
+            chunk = s.recv(min(CHUNK, MAX_RPC_BYTES + 1 - len(buf)))
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > MAX_RPC_BYTES:
+                raise RuntimeError("the daemon's answer to %s exceeded %d bytes"
+                                   % (method, MAX_RPC_BYTES))
     finally:
         s.close()
     if not buf.strip():
@@ -133,39 +336,40 @@ def tunnel_up(state):
 
 # ------------------------------------------------------------- app's own data
 
-def _load_json(path):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
-
-
 def app_cache():
-    return _load_json(os.path.join(APP_DIR, "cache.json")) or {}
+    return _read_json_in(APP_REL, "cache.json", MAX_APP_JSON) or {}
 
 
 def app_settings():
     """Each account gets its own settings-<uuid>.json. `settings-undefined.json`
     is the pre-login template and is skipped on purpose."""
-    best = None
     try:
-        names = os.listdir(APP_DIR)
-    except OSError:
+        dir_fd = _open_dir(APP_REL, create=False)
+    except (OSError, Unsafe):
         return {}
-    for n in names:
-        if not (n.startswith("settings-") and n.endswith(".json")):
-            continue
-        if n == "settings-undefined.json":
-            continue
-        p = os.path.join(APP_DIR, n)
+    try:
+        best = None
+        for n in os.listdir(dir_fd):
+            if not (n.startswith("settings-") and n.endswith(".json")):
+                continue
+            if n == "settings-undefined.json":
+                continue
+            try:
+                st = os.stat(n, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if best is None or st.st_mtime > best[0]:
+                best = (st.st_mtime, n)
+        if not best:
+            return {}
         try:
-            mtime = os.path.getmtime(p)
-        except OSError:
-            continue
-        if best is None or mtime > best[0]:
-            best = (mtime, p)
-    return (_load_json(best[1]) if best else None) or {}
+            return json.loads(_read_file(dir_fd, best[1], MAX_APP_JSON).decode("utf-8")) or {}
+        except (OSError, ValueError, Unsafe):
+            return {}
+    finally:
+        os.close(dir_fd)
 
 
 def _cache_value(cache, suffix):
@@ -203,6 +407,55 @@ def generic(all_servers):
 
 # ---------------------------------------------------------------------- geo
 
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect may not move the request to another host.
+
+    Without this, whoever answers decides where the next request goes — and the
+    answer is what the panel then shows as your public IP and country. Staying
+    on the same host still allows the ordinary http -> https upgrade.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        if new.scheme not in ("http", "https") or new.hostname != old.hostname:
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                "refusing to follow a redirect off %s" % (old.hostname or "the server"),
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = None
+
+
+def _opener():
+    global _OPENER
+    if _OPENER is None:
+        _OPENER = urllib.request.build_opener(_SameHostRedirect)
+    return _OPENER
+
+
+def _read_capped(resp, limit, what):
+    """Read a response body, refusing anything past the cap.
+
+    The declared length is checked first when there is one, but it is only a
+    hint — the read itself is what enforces the limit.
+    """
+    declared = resp.headers.get("Content-Length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise Unsafe("%s is larger than %d bytes" % (what, limit))
+    buf = b""
+    while len(buf) <= limit:
+        chunk = resp.read(min(CHUNK, limit + 1 - len(buf)))
+        if not chunk:
+            break
+        buf += chunk
+    if len(buf) > limit:
+        raise Unsafe("%s is larger than %d bytes" % (what, limit))
+    return buf
+
+
 _geo = {"at": 0, "data": None}
 
 
@@ -211,9 +464,11 @@ def geo():
         return _geo["data"]
     try:
         req = urllib.request.Request(GEO_URL, headers={"User-Agent": "omarchy-surfshark"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            d = json.loads(r.read().decode())
+        with _opener().open(req, timeout=8) as r:
+            d = json.loads(_read_capped(r, MAX_GEO_BYTES, "the geo response").decode("utf-8"))
     except Exception:
+        return _geo["data"] or {}
+    if not isinstance(d, dict):
         return _geo["data"] or {}
     _geo["at"] = time.time()
     _geo["data"] = d
@@ -347,20 +602,24 @@ def find_host(all_servers, host):
 
 def read_key():
     try:
-        with open(KEY_FILE) as f:
-            k = f.read().strip()
-        return k or None
-    except OSError:
+        dir_fd = cfg_dir(create=False)
+    except (OSError, Unsafe):
         return None
+    try:
+        k = _read_text_in(dir_fd, KEY_NAME, MAX_KEY_BYTES)
+        return (k or "").strip() or None
+    finally:
+        os.close(dir_fd)
 
 
 def store_key(k):
-    _ensure_dir()
-    tmp = KEY_FILE + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(k + "\n")
-    os.replace(tmp, KEY_FILE)
+    """The account's private key. Written 0600 into a directory verified to be
+    ours, through a temporary that cannot be pre-empted."""
+    dir_fd = cfg_dir()
+    try:
+        _write_private(dir_fd, KEY_NAME, (k + "\n").encode("utf-8"))
+    finally:
+        os.close(dir_fd)
 
 
 def key_from_nm():
@@ -408,24 +667,29 @@ def hidden():
     back and the button would look broken. So whatever was on the list at the
     moment of clearing is remembered as hidden, until you connect there again.
     """
-    v = _load_json(HIDDEN_FILE)
+    v = _read_json_in(CFG_REL, HIDDEN_NAME, MAX_OWN_JSON, own=True)
     return set(v) if isinstance(v, list) else set()
 
 
 def store_hidden(names):
-    _ensure_dir()
-    tmp = HIDDEN_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(sorted(names), f, indent=1)
-    os.replace(tmp, HIDDEN_FILE)
+    dir_fd = cfg_dir()
+    try:
+        _write_private(dir_fd, HIDDEN_NAME,
+                       json.dumps(sorted(names), indent=1).encode("utf-8"))
+    finally:
+        os.close(dir_fd)
+
+
+def own_recent():
+    v = _read_json_in(CFG_REL, RECENT_NAME, MAX_OWN_JSON, own=True)
+    return [i for i in v if isinstance(i, dict)] if isinstance(v, list) else []
 
 
 def recent(limit=None):
     """Merge our own log with the app's `recents`, so the list is the same no
     matter where the connection was started from."""
     skip = hidden()
-    mine = [i for i in (_load_json(RECENT_FILE) or [])
-            if i.get("connectionName") not in skip]
+    mine = [i for i in own_recent() if i.get("connectionName") not in skip]
     items = list(mine)
     have = {i.get("connectionName") for i in items}
     all_servers = servers()
@@ -453,7 +717,6 @@ def recent(limit=None):
 
 
 def push_recent(s):
-    _ensure_dir()
     entry = {
         "connectionName": s["connectionName"],
         "country": s.get("country", ""),
@@ -461,30 +724,38 @@ def push_recent(s):
         "location": s.get("location", ""),
         "usedAt": time.time(),
     }
-    mine = [i for i in (_load_json(RECENT_FILE) or [])
+    mine = [i for i in own_recent()
             if i.get("connectionName") != entry["connectionName"]]
     mine.insert(0, entry)
     was = hidden()
     if entry["connectionName"] in was:
         store_hidden(was - {entry["connectionName"]})
-    tmp = RECENT_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(mine[:10], f, indent=1)
-    os.replace(tmp, RECENT_FILE)
+    dir_fd = cfg_dir()
+    try:
+        _write_private(dir_fd, RECENT_NAME,
+                       json.dumps(mine[:10], indent=1).encode("utf-8"))
+    finally:
+        os.close(dir_fd)
 
 
 def note_current(host):
-    _ensure_dir()
-    with open(os.path.join(CFG_DIR, "current"), "w") as f:
-        f.write(host + "\n")
+    dir_fd = cfg_dir()
+    try:
+        _write_private(dir_fd, CURRENT_NAME, (host + "\n").encode("utf-8"))
+    finally:
+        os.close(dir_fd)
 
 
 def current_host():
     try:
-        with open(os.path.join(CFG_DIR, "current")) as f:
-            return f.read().strip() or None
-    except OSError:
+        dir_fd = cfg_dir(create=False)
+    except (OSError, Unsafe):
         return None
+    try:
+        v = _read_text_in(dir_fd, CURRENT_NAME, MAX_KEY_BYTES)
+        return (v or "").strip() or None
+    finally:
+        os.close(dir_fd)
 
 
 # ---------------------------------------------------------------- connecting
@@ -588,8 +859,48 @@ def cmd_status():
     print(json.dumps(out, indent=1))
 
 
+def cmd_recent_clear():
+    # Set aside rather than delete. Clearing is one click with no confirmation,
+    # so it must be undoable — see `recent-restore`.
+    store_hidden({i["connectionName"] for i in recent()} | hidden())
+    dir_fd = cfg_dir()
+    try:
+        os.replace(RECENT_NAME, RECENT_BAK_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+    print("recent list cleared (undo with: omarchy-surfshark recent-restore)")
+
+
+def cmd_recent_restore():
+    dir_fd = cfg_dir()
+    try:
+        try:
+            os.replace(RECENT_BAK_NAME, RECENT_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            restored = True
+        except OSError:
+            restored = False
+        try:
+            os.unlink(HIDDEN_NAME, dir_fd=dir_fd)
+        except OSError:
+            pass
+    finally:
+        os.close(dir_fd)
+    print("recent list restored" if restored
+          else "nothing set aside; un-hid the app's own entries")
+
+
 def main():
-    args = sys.argv[1:]
+    try:
+        run(sys.argv[1:])
+    except Unsafe as e:
+        # The panel shows the last line of stderr, so a refused path should read
+        # as a sentence rather than as the tail of a traceback.
+        _die(str(e), 8)
+
+
+def run(args):
     cmd = args[0] if args else "status"
 
     if cmd == "status":
@@ -636,24 +947,9 @@ def main():
         out.sort(key=lambda i: (i["country"], i["location"]))
         print(json.dumps(out))
     elif cmd == "recent-clear":
-        # Set aside rather than delete. Clearing is one click with no
-        # confirmation, so it must be undoable — see `recent-restore`.
-        store_hidden({i["connectionName"] for i in recent()} | hidden())
-        try:
-            os.replace(RECENT_FILE, RECENT_BAK)
-        except OSError:
-            pass
-        print("recent list cleared (undo with: omarchy-surfshark recent-restore)")
+        cmd_recent_clear()
     elif cmd == "recent-restore":
-        restored = os.path.exists(RECENT_BAK)
-        if restored:
-            os.replace(RECENT_BAK, RECENT_FILE)
-        try:
-            os.remove(HIDDEN_FILE)
-        except OSError:
-            pass
-        print("recent list restored" if restored
-              else "nothing set aside; un-hid the app's own entries")
+        cmd_recent_restore()
     elif cmd == "recent":
         n = int(args[1]) if len(args) > 1 else 10
         print(json.dumps(recent(n), indent=1))
@@ -670,7 +966,7 @@ def main():
             _die("no WireGuard key found in any NetworkManager profile. Connect "
                  "once through the Surfshark app, then try again.", 7)
         store_key(k)
-        print("key saved to %s" % KEY_FILE)
+        print("key saved to %s" % os.path.join(CFG_DISPLAY, KEY_NAME))
     elif cmd == "state":
         print(json.dumps(get_state(), indent=1))
     else:

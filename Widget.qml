@@ -45,7 +45,7 @@ Panel {
   readonly property string usLabel: {
     for (var i = 0; i < root.allLocations.length; i++)
       if (root.allLocations[i].connectionName === root.usLocation)
-        return String(root.allLocations[i].location)
+        return root.plain(root.allLocations[i].location)
     var m = /^us-([a-z]+)\./.exec(root.usLocation)
     return m ? m[1].toUpperCase() : "United States"
   }
@@ -136,6 +136,26 @@ Panel {
   readonly property string statePhrase:
     activePhrases[phraseIndex % activePhrases.length]
 
+  // Strip what would make a string stop being a string.
+  //
+  // A Text element left at `Text.AutoText` promotes anything that looks like
+  // markup to rich text, and rich text with an embedded remote reference makes
+  // the shell fetch it — inside a process that stays alive for the whole
+  // session. The public IP and country come straight off the network, the
+  // location and country names come out of the Surfshark app's cache, and the
+  // error line is the daemon's own message, so all of them are treated as data:
+  // `<` is removed outright rather than escaped, because an escaped entity only
+  // renders correctly if the consumer is *already* in rich-text mode, and the
+  // point is that it never should be. Control characters go too, so a crafted
+  // name cannot break a one-line tooltip into several.
+  //
+  // This widget's own labels are pinned to `Text.PlainText` as well, but that
+  // pin cannot reach `PanelHero` or the bar tooltip, which the shell owns.
+  function plain(s) {
+    return String(s === undefined || s === null ? "" : s)
+             .replace(/[<\x00-\x1f\x7f]/g, "")
+  }
+
   function refresh() {
     if (statusProcess.running) return
     statusProcess.command = [root.script, "status"]
@@ -185,11 +205,11 @@ Panel {
     root.configured = d.configured === true
     root.daemonReady = d.daemon === true
     root.connected = d.connected === true
-    root.location = String(d.location || "")
-    root.country = String(d.country || "")
-    root.myCountry = String(d.myCountry || "")
-    root.myCountryCode = String(d.myCountryCode || "")
-    root.publicIp = String(d.ip || "")
+    root.location = root.plain(d.location)
+    root.country = root.plain(d.country)
+    root.myCountry = root.plain(d.myCountry)
+    root.myCountryCode = root.plain(d.myCountryCode)
+    root.publicIp = root.plain(d.ip)
     root.secured = d.secured === true
     root.recentList = d.recent || []
     // Stvarnost je stigla do zeljenog stanja — prestani da je prepisujes.
@@ -272,7 +292,7 @@ Panel {
       root.busy = false
       if (exitCode !== 0) {
         root.desired = -1
-        root.lastError = String(actionErr.text || "").trim().split("\n").pop()
+        root.lastError = root.plain(String(actionErr.text || "").trim().split("\n").pop())
       }
       root.refresh()
     }
@@ -421,6 +441,7 @@ Panel {
           // Without the key there is nothing to switch on, so instead of failing
           // silently the panel spells out what is missing.
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: !root.configured || !root.daemonReady
             text: !root.daemonReady
@@ -433,6 +454,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.lastError !== ""
             text: root.lastError
@@ -507,6 +529,7 @@ Panel {
               // Clears the list. Deliberately unconfirmed: only history is lost,
               // and every location is still one search away.
               Text {
+                textFormat: Text.PlainText
                 id: clearButton
                 anchors.right: parent.right
                 anchors.verticalCenter: recentHeader.verticalCenter
@@ -535,9 +558,9 @@ Panel {
               ActionRow {
                 required property var modelData
                 width: parent.width
-                label: String(modelData.location || modelData.connectionName || "")
-                detail: String(modelData.country || "")
-                current: root.shown && String(modelData.location || "") === root.location
+                label: root.plain(modelData.location || modelData.connectionName)
+                detail: root.plain(modelData.country)
+                current: root.shown && root.plain(modelData.location) === root.location
                 onActivated: root.connectTo(String(modelData.connectionName || ""))
               }
             }
@@ -578,6 +601,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.query.trim() !== "" && root.results.length === 0
               text: "No location matches “" + root.query.trim() + "”."
@@ -592,14 +616,15 @@ Panel {
               ActionRow {
                 required property var modelData
                 width: parent.width
-                label: String(modelData.location || "")
-                detail: String(modelData.country || "")
-                current: root.shown && String(modelData.location || "") === root.location
+                label: root.plain(modelData.location)
+                detail: root.plain(modelData.country)
+                current: root.shown && root.plain(modelData.location) === root.location
                 onActivated: root.connectTo(String(modelData.connectionName || ""))
               }
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.hiddenMatches > 0
               text: "+" + root.hiddenMatches + " more — keep typing to narrow"
@@ -610,6 +635,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.publicIp !== ""
             // The country is whatever the *current* public IP resolves to, not
@@ -669,6 +695,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: rowLabel
         text: actionRow.label
         color: root.foreground
@@ -682,6 +709,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: rowDetail
         text: actionRow.detail
         color: root.dim

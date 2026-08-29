@@ -232,9 +232,42 @@ app calls Quick Connect. Recents are merged with the app's own `recents` from
 `settings-<account>.json`, so the list is the same no matter where a connection
 was started from.
 
+## What it trusts
+
+There is a private key in this directory, so none of the inputs get the benefit
+of the doubt.
+
+**Nothing is read without a limit.** The geo response, the Surfshark app's own
+cache, the daemon's replies on the unix socket and this plugin's own files are
+all read through a hard byte cap that is checked *before* the bytes are parsed —
+256 KiB for the geo response, 16 MiB for the app cache (a full server list is
+about 120 KB), 4 MiB for one daemon reply. Anything past the cap is refused
+rather than truncated.
+
+**Paths cannot be redirected.** `~/.config/omarchy-surfshark` is opened one
+component at a time with `O_NOFOLLOW` and verified to be a directory owned by
+you; it is tightened to `0700` in place if it is not, since a mode handed to
+`makedirs` does nothing to a directory that already exists. Files are opened
+relative to that descriptor instead of by walking a path a second time, and
+writes land in a randomly named temporary created `O_EXCL | O_NOFOLLOW` at
+`0600`, published with a descriptor-relative rename. A symlink planted at
+`wg.key` is replaced, never followed and never written through.
+
+**The geo lookup stays on its own host.** `api.surfshark.com` answering with a
+redirect somewhere else is refused rather than followed; the same-host
+http→https upgrade still works.
+
+**Everything it displays is drawn as text.** The public IP and country come off
+the network, the location and country names out of the app's cache, and the
+error line is the daemon's own message. Every `Text` element is pinned to
+`Text.PlainText`, and the two places the shell draws rather than this widget —
+the panel hero and the bar tooltip — get a string with markup and control
+characters stripped first. Nothing that arrives from outside can be promoted to
+rich text inside the shell process.
+
 ## Files it writes
 
-Everything lives in `~/.config/omarchy-surfshark/`:
+Everything lives in `~/.config/omarchy-surfshark/`, which is created `0700`:
 
 | File | Contents |
 | --- | --- |
@@ -243,9 +276,9 @@ Everything lives in `~/.config/omarchy-surfshark/`:
 | `hidden.json` | entries suppressed by `CLEAR` |
 | `current` | the last host connected to |
 
-Nothing is sent anywhere except Surfshark's own endpoints: the daemon socket on
-your machine, and `api.surfshark.com/v1/server/user` to learn your current public
-IP and country.
+Every file is written `0600`. Nothing is sent anywhere except Surfshark's own
+endpoints: the daemon socket on your machine, and
+`api.surfshark.com/v1/server/user` to learn your current public IP and country.
 
 ## Troubleshooting
 
