@@ -1,14 +1,29 @@
+<div align="center">
+
 # Surfshark for the Omarchy bar
 
-A Surfshark VPN widget for the [Omarchy](https://omarchy.org) shell: on/off in
-the bar, quick jumps to the fastest, nearest, local, US or a random location,
-your recent locations, and a search across every location your account has.
+**On/off in the bar, quick jumps to the fastest, nearest, local, US or a random
+location, your recent locations, and a search across every location your account
+has.**
 
-![The Surfshark panel](screenshot.png)
+Built for the [Omarchy](https://omarchy.org) shell. It drives the **official
+Surfshark client's own daemon**, so the app and the bar never disagree and there
+is no second VPN tunnel fighting the first one over routing. No root, no helper
+binary, no `sudo` rules.
 
-It drives the **official Surfshark client's own daemon**, so the app and the bar
-never disagree and there is no second VPN tunnel fighting the first one over
-routing. No root, no helper binary, no `sudo` rules.
+[Install](#install) &nbsp;&middot;&nbsp; [First run](#first-run-connect-once-through-the-app) &nbsp;&middot;&nbsp; [Using it](#using-it) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [Report a bug](../../issues/new)
+
+[![Stars](https://img.shields.io/github/stars/nenadjokic/omarchy-surfshark?label=stars&color=0E7490&style=flat-square)](../../stargazers)
+[![License](https://img.shields.io/github/license/nenadjokic/omarchy-surfshark?color=0E7490&style=flat-square)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/nenadjokic/omarchy-surfshark?color=0E7490&style=flat-square)](../../commits/main)
+[![Issues](https://img.shields.io/github/issues/nenadjokic/omarchy-surfshark?color=0E7490&style=flat-square)](../../issues)
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=flat-square&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/nenadjokic)
+[![PayPal](https://img.shields.io/badge/PayPal-0070BA?style=flat-square&logo=paypal&logoColor=white)](https://paypal.me/nenadjokicRS)
+
+<img src="docs/panel.png" alt="The Surfshark panel" width="420">
+
+</div>
 
 > **Unofficial.** This project is not affiliated with, endorsed by, or supported
 > by Surfshark. It talks to a private, undocumented IPC socket belonging to the
@@ -69,6 +84,18 @@ click refreshes.
 | **Random country** | A random country you are not already in |
 | **Recent** | Reconnect to somewhere you have been; `CLEAR` empties the list |
 | **All locations** | Search every location by city, country or country code |
+
+<div align="center">
+
+| Connected | Searching |
+| --- | --- |
+| <img src="docs/connected.png" alt="Connected to New York" width="330"> | <img src="docs/search.png" alt="Searching locations" width="330"> |
+
+The bar icon, tunnel down and tunnel up:
+
+<img src="docs/bar.png" alt="The bar icon in both states" width="420">
+
+</div>
 
 Two of these are opinionated on purpose:
 
@@ -248,6 +275,21 @@ omarchy restart shell
 ```
 
 Removing the plugin does not touch the Surfshark client or any tunnel it set up.
+
+## Support the developer
+
+This widget is free, with no ads and no tracking. If it earns a place in your
+bar, a coffee genuinely helps and means a lot.
+
+<div align="center">
+
+[<img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee">](https://buymeacoffee.com/nenadjokic)
+&nbsp;
+[<img src="https://img.shields.io/badge/PayPal-0070BA?style=for-the-badge&logo=paypal&logoColor=white" alt="PayPal">](https://paypal.me/nenadjokicRS)
+
+</div>
+
+---
 
 ## License
 
