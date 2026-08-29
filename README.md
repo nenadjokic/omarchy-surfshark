@@ -8,8 +8,9 @@ has.**
 
 Built for the [Omarchy](https://omarchy.org) shell. It drives the **official
 Surfshark client's own daemon**, so the app and the bar never disagree and there
-is no second VPN tunnel fighting the first one over routing. No root, no helper
-binary, no `sudo` rules.
+is no second VPN tunnel fighting the first one over routing. It needs no elevated
+privileges at all: no setuid helper, no extra system service, and nothing that
+ever prompts you for a password.
 
 [Install](#install) &nbsp;&middot;&nbsp; [First run](#first-run-connect-once-through-the-app) &nbsp;&middot;&nbsp; [Using it](#using-it) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [Report a bug](../../issues/new)
 
